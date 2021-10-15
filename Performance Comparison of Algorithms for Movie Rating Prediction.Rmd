@@ -1,0 +1,817 @@
+---
+title: "Data Mining Project"
+author: "Varsha Rajasekar"
+date: "5/8/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(caret)
+library(data.table)
+library(kableExtra)
+library(lubridate)
+library(Matrix.utils)
+library(DT)
+library(wordcloud) 
+library(RColorBrewer) 
+library(ggthemes) 
+library(irlba)
+library(recommenderlab)
+library(recosystem)
+library(h2o)
+```
+
+```{r}
+# Ratings dataset
+ratings <- read_csv("/Users/varsharajasekar/Downloads/ml-latest-small/ratings.csv")
+
+glimpse(ratings)
+
+```
+
+
+
+
+```{r}
+#Movies dataset
+movies <- read_csv("/Users/varsharajasekar/Downloads/ml-latest-small/movies.csv")
+glimpse(movies)
+movies
+
+```
+
+
+
+```{r}
+# Tags dataset
+tags <- read_csv("/Users/varsharajasekar/Downloads/ml-latest-small/tags.csv")
+glimpse(tags)
+
+tags
+summary(tags)
+```
+
+
+```{r}
+#Combining ratings and movies dataset
+movielens <- merge(ratings,movies,by=c("movieId"))
+
+summary(movielens)
+head(movielens,10)
+```
+
+
+```{r}
+set.seed(42)
+partition <- createDataPartition(y = movielens$rating, p = 0.6, list = F)
+training <-  movielens[partition, ]
+validation <- movielens[-partition, ]
+```
+
+### PART A: Regression
+```{r}
+# Movie effect
+
+# Calculate the average of all ratings 
+mu <- mean(training$rating)
+
+# Calculate Beta_m 
+movie_effect <- training %>% 
+  group_by(movieId) %>% 
+  summarize(Bm = mean(rating - mu))
+
+# Predict ratings
+pred_Bm <- mu + validation %>% 
+  left_join(movie_effect, by='movieId') %>%
+  .$Bm
+
+
+# Movie + User effect
+
+# Calculate Beta_u  
+user_effect <- training %>%  
+  left_join(movie_effect, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(Bu = mean(rating - mu - Bm))
+
+# Predict ratings
+pred_Bu <- validation %>% 
+  left_join(movie_effect, by='movieId') %>%
+  left_join(user_effect, by='userId') %>%
+  mutate(pred = mu + Bm + Bu) %>%
+  .$pred
+
+
+# Movie + User + Time effect
+   
+# Calculate Beta_t 
+time_effect <- training %>%
+  left_join(movie_effect, by='movieId') %>%
+  left_join(user_effect, by='userId') %>%
+  mutate(date = round_date(as_datetime(timestamp), unit = "week")) %>%
+  group_by(date) %>%
+  summarize(Bt = mean(rating - mu - Bm - Bu))
+
+ 
+# Predicted ratings
+valid <- validation %>%
+  mutate(date = round_date(as_datetime(timestamp), unit = "week"))
+
+pred_Bt <- valid %>%
+  left_join(movie_effect, by='movieId') %>%
+  left_join(user_effect, by='userId') %>%
+  left_join(time_effect, by='date') %>%
+  mutate(pred = mu + Bm + Bu + Bt) %>%
+  .$pred
+
+```
+
+```{r}
+rmse_Bm <- RMSE(validation$rating,pred_Bm)  
+rmse_Bm
+```
+
+```{r}
+rmse_Bu <- RMSE(validation$rating,pred_Bu)
+rmse_Bu
+```
+
+```{r}
+rmse_Bt <- RMSE(valid$rating,pred_Bt)
+rmse_Bt
+```
+
+
+```{r}
+# Regularization using lasso parameter
+
+lambdas <- seq(0, 10, 0.25)
+  
+  rmses <- sapply(lambdas, function(l){
+    
+    mu_reg <- mean(training$rating)
+    
+    Bm_reg <- training %>% 
+      group_by(movieId) %>%
+      summarize(Bm_reg = sum(rating - mu_reg)/(n()+l))
+    
+    Bu_reg <- training %>% 
+      left_join(Bm_reg, by="movieId") %>%
+      group_by(userId) %>%
+      summarize(Bu_reg = sum(rating - Bm_reg - mu_reg)/(n()+l))
+    
+    rating_pred <- 
+      validation %>% 
+      left_join(Bm_reg, by = "movieId") %>%
+      left_join(Bu_reg, by = "userId") %>%
+      mutate(pred = mu_reg + Bm_reg + Bu_reg) %>%
+      .$pred
+    
+    return(RMSE(validation$rating,rating_pred))
+  })
+```
+
+```{r}
+#For the full model, the optimal  λ is:
+    
+lambda <- lambdas[which.min(rmses)]
+lambda
+```
+
+```{r}
+rmse_reg <- min(rmses)
+rmse_reg
+```
+
+```{r}
+rmse_regression <- data.frame(Methods=c("movie effect","movie + user effects","movie + user + time effects","Regularized Movie + User Effect"),RMSE = c(rmse_Bm, rmse_Bu,rmse_Bt,rmse_reg))
+
+kable(rmse_regression) %>%
+  kable_styling(bootstrap_options = "striped" , full_width = F , position = "center") %>%
+  kable_styling(bootstrap_options = "bordered", full_width = F , position ="center") %>%
+  column_spec(1,bold = T ) %>%
+  column_spec(2,bold =T )
+```
+
+
+
+### PART B: Recommender Engines
+```{r}
+
+train1 <- movielens %>% 
+  mutate(userId = as.factor(movielens$userId)) %>% 
+  mutate(movieId = as.factor(movielens$movieId))
+
+train1$userId <- as.numeric(train1$userId)
+train1$movieId <- as.numeric(train1$movieId)
+
+sparse_mat_rating <- sparseMatrix(i = train1$userId,
+                         j = train1$movieId ,
+                         x = train1$rating, 
+                         dims = c(length(unique(train1$userId)),
+                                  length(unique(train1$movieId))),  
+                         dimnames = list(paste("u", 1:length(unique(train1$userId)), sep = ""), 
+                                        paste("m", 1:length(unique(train1$movieId)), sep = "")))
+
+rm(train1)
+
+```
+
+```{r}
+#Convert rating matrix into a recommenderlab sparse matrix
+rating_matrix <- new("realRatingMatrix", data = sparse_mat_rating)
+rating_matrix
+```
+
+```{r}
+# Cosine similarity for users
+
+users_sim_mat <- similarity(rating_matrix[1:50,], 
+                               method = "cosine", 
+                               which = "users")
+
+image(as.matrix(users_sim_mat), main = "User similarity")
+
+
+
+# Cosine similarity for movies
+
+movies_sim_mat <- similarity(rating_matrix[,1:50], 
+                               method = "cosine", 
+                               which = "items")
+
+image(as.matrix(movies_sim_mat), main = "Movies similarity")
+```
+
+```{r}
+# Minimum number of movies per user
+min_n_movies <- quantile(rowCounts(rating_matrix), 0.9)
+print(min_n_movies)
+
+# Minimum number of users per movie
+min_n_users <- quantile(colCounts(rating_matrix), 0.9)
+print(min_n_users)
+
+# Selecting users and movies according to the above criterion
+ratings <- rating_matrix[rowCounts(rating_matrix) > min_n_movies,
+                            colCounts(rating_matrix) > min_n_users]
+ratings
+```
+
+#### Using cross-validation to validate models
+
+We will The k-fold cross-validation approach since is the most accurate one, although it's computationally heavier. 
+
+Using this approach, we split the data into some chunks, take a chunk out as the test set, and evaluate the accuracy. Then, we can do the same with each other chunk and compute the average accuracy.  
+
+For each user in the test set, we need to define how many items to use to generate recommendations. For this, I first check the minimum number of items rated by users to be sure there will be no users with no items to test.
+
+```{r k-fold, message=FALSE, warning=FALSE}
+min(rowCounts(rating_matrix))
+items_to_keep <- 10 #number of items to generate recommendations
+rating_threshold <- 4 # threshold with the minimum rating that is considered good
+
+n_fold <- 10
+eval_sets <- evaluationScheme(data = ratings, 
+                              method = "cross-validation",
+                              k = n_fold, 
+                              given = items_to_keep, 
+                              goodRating = rating_threshold)
+size_sets <- sapply(eval_sets@runsTrain, length)
+size_sets
+```
+
+Using ten-fold approach, we get ten sets of the same size 54.
+
+#### UBCF Model
+
+Let's have a look at the default parameters of IBCF model.  
+nn: number of similar users
+Method: similarity funtion, which is Cosine by default, may also be pearson. 
+
+```{r UBCF default parameters}
+recommender_models <- recommenderRegistry$get_entries(dataType ="realRatingMatrix")
+recommender_models$UBCF_realRatingMatrix$parameters
+```
+
+We have a parameter nn which we need to vary and check for the optimized model based on precision and recall. We will the cross validation sets which we generated earlier for better results. 
+
+```{r Parameters tuning for UBCF method, message=FALSE}
+# UBCF takes account of the nn-number of similar users. I will explore values, ranging between 5 and 75, in order to tune this parameter:
+vector_nn <- c(5, 10, 20, 30, 40, 50, 60, 75)
+models_to_evaluate <- lapply(vector_nn, function(nn){
+  list(name = "UBCF",
+       param = list(method = "cosine", nn = nn))
+})
+names(models_to_evaluate) <- paste0("UBCF_k_", vector_nn)
+
+#Now I build and evaluate the same UBCF models with different values of the nn-number of similar users.
+n_recommendations <- c(1, 5, seq(10, 100, 10))
+list_results <- evaluate(x = eval_sets, 
+                         method = models_to_evaluate, 
+                         n = n_recommendations)
+plot(list_results, annotate = 1, legend = "topleft") 
+title("ROC curve")
+plot(list_results, "prec/rec", annotate = 1, legend = "bottomright")
+title("Precision-recall")
+```
+
+Based on both the graphs we can say that the UBCF model with nn=50 performs better. We will use nn=50 to build the model.
+
+#### IBCF Method
+Let's have a look at the default parameters of IBCF model.  
+k: number of items to compute the similarities.
+Method: similarity funtion, which is Cosine by default, may also be pearson. 
+
+```{r UBCF default parameters}
+recommender_models <- recommenderRegistry$get_entries(dataType ="realRatingMatrix")
+recommender_models$IBCF_realRatingMatrix$parameters
+```
+
+```{r Parameters tuning for IBCF method}
+# IBCF takes account of the k-closest items. I will explore values, ranging between 5 and 50, in order to tune this parameter:
+vector_k <- c(5, 10, 15, 20, 25, 30, 40, 50)
+models_to_evaluate <- lapply(vector_k, function(k){
+  list(name = "IBCF",
+       param = list(method = "cosine", k = k))
+})
+names(models_to_evaluate) <- paste0("IBCF_k_", vector_k)
+
+#Now I build and evaluate the same IBCF/cosine models with different values of the k-closest items:
+n_recommendations <- c(1, 5, 10, 20, 25, 30, 40, 50)
+list_results <- evaluate(x = eval_sets, 
+                         method = models_to_evaluate, 
+                         n = n_recommendations)
+plot(list_results, annotate = 1, legend = "topleft") 
+title("ROC curve")
+plot(list_results, "prec/rec", annotate = 1, legend = "bottomright")
+title("Precision-recall")
+```
+
+From both the graphs we can see that k=15 performs well over the course for different number of reccomendations.
+
+#### Comparing algorithms
+
+We will compare both UBCF and IBCF models but we will also include two other basic models. Those are popular method based and random method based.  
+
+In popular method based model we predict/recommend movies based on the most popular movies and in random method based model we recommend movies randomly.
+
+First we will comparing these models on precision, recall etc
+
+```{r}
+algorithms <- list( "random items" = list(name="RANDOM", param=NULL), 
+                    "popular items" = list(name="POPULAR", param=NULL),
+                    "user-based CF" = list(name="UBCF", param=list(nn=50)),
+                    "item-based CF" = list(name="IBCF", param=list(k=15))
+)
+
+results <- evaluate(eval_sets, algorithms,type = "topNList", n=c(1,3,5,10,15,20))
+plot(results, annotate=c(1,3), legend="bottomright")
+plot(results, "prec/rec", annotate=3, legend="topleft")
+```
+
+From both the models we can see that popular method based and UBCF models performing well.
+
+Next we compare them based on movie ratings prediction.
+
+```{r Builiding and testing popular method model}
+set.seed(1)
+train2 <- evaluationScheme(ratings, method="split",train=0.7, given=10, goodRating = 4)
+
+# Popular method
+popular_model <- Recommender(getData(train2, "train"), "POPULAR",param=list(normalize = "center"))
+popular_pred <- predict(popular_model, getData(train2, "known"), type="ratings")
+rmse_popular <- calcPredictionAccuracy(popular_pred, getData(train2, "unknown"))
+
+# Random method
+random_model <- Recommender(getData(train2, "train"), "RANDOM",param=list(normalize = "center"))
+random_pred <- predict(random_model, getData(train2, "known"), type="ratings")
+rmse_random <- calcPredictionAccuracy(random_pred, getData(train2, "unknown"))
+
+# UBCF method
+ubcf_model <- Recommender(getData(train2, "train"), method = "UBCF", 
+                     param=list(normalize = "center", method="Cosine", nn=50))
+ubcf_pred <- predict(ubcf_model, getData(train2, "known"), type="ratings")
+rmse_ubcf <- calcPredictionAccuracy(ubcf_pred, getData(train2, "unknown"))
+
+# IBCF method
+ibcf_model <- Recommender(getData(train2, "train"), method = "IBCF", 
+                          param=list(normalize = "center", method="Cosine", k=15))
+ibcf_pred <- predict(ibcf_model, getData(train2, "known"), type="ratings")
+rmse_ibcf <- calcPredictionAccuracy(ibcf_pred, getData(train2, "unknown"))
+rmse_ibcf
+
+rmse_recommender <- data.frame(methods=c("Popularity Model", "Random Model","UBCF Model","IBCF Model"),
+                               rmse = c(rmse_popular[1],rmse_random[1],rmse_ubcf[1],rmse_ibcf[1]),
+                               mse = c(rmse_popular[2],rmse_random[2],rmse_ubcf[2],rmse_ibcf[2]),
+                               mae = c(rmse_popular[3],rmse_random[3],rmse_ubcf[3],rmse_ibcf[3]))
+
+kable(rmse_recommender) %>%
+  kable_styling(bootstrap_options = "striped" , full_width = F , position = "center") %>%
+  kable_styling(bootstrap_options = "bordered", full_width = F , position ="center") %>%
+  column_spec(1,bold = T )
+```
+
+As you can see, again both popular method based and UBCF models perform well. But UBCF has an advantage that it recommends different movies to users based on them, whereas popular method based recommends same movies to all the users.
+
+
+### PART C: Tree Based Methods
+```{r}
+train3 <- training
+
+# Creating new columns for number of movies each user rated and number of users that rated each movie
+
+train3 <- train3 %>%
+            group_by(userId) %>%
+            mutate(movies_per_user = n())
+
+train3 <- train3 %>%
+  group_by(movieId) %>%
+  mutate(users_per_movie = n())
+
+train3$userId <-  as.factor(train3$userId)
+train3$movieId <- as.factor(train3$movieId)
+train3
+
+valid <- validation  
+
+valid <- valid %>%
+  group_by(userId) %>%
+  mutate(movies_per_user = n())
+
+valid <- valid %>%
+  group_by(movieId) %>%
+  mutate(users_per_movie = n())
+
+valid$userId  <- as.factor(valid$userId)
+valid$movieId <- as.factor(valid$movieId)
+
+```
+
+
+```{r}
+# connect to H2O instance 
+h2o.init(
+ nthreads=-1,                   
+ max_mem_size = "16G")
+h2o.removeAll()
+
+```
+
+```{r}
+#partitioning 
+splits <- h2o.splitFrame(as.h2o(train3), 
+                         ratios = 0.7, 
+                         seed = 1)
+```
+
+```{r}
+train <- splits[[1]]
+test <- splits[[2]]
+```
+
+```{r}
+#clear unusued memory
+invisible(gc())
+
+#remove progress bar
+h2o.no_progress()
+
+gbm_default <- h2o.gbm( x = c("movieId","userId","movies_per_user","users_per_movie") ,
+           y = "rating" , 
+           training_frame = train ,
+           nfolds = 5,
+           )
+
+gbm_default
+
+```
+
+```{r}
+# Performing 5-fold cross-validation
+gbm_model1 <- h2o.gbm( x = c("movieId","userId","movies_per_user","users_per_movie") ,
+           y = "rating" , 
+           training_frame = train ,
+           nfolds = 5,
+           ntrees = 100,
+           stopping_rounds = 10,
+           stopping_tolerance = 0,
+           seed = 123,
+           keep_cross_validation_predictions = TRUE,
+           fold_assignment = "Random")
+
+gbm_model1
+
+```
+
+```{r}
+# Performing 10-fold cross-validation
+gbm_model2 <- h2o.gbm( x = c("movieId","userId","movies_per_user","users_per_movie") ,
+           y = "rating" , 
+           training_frame = train ,
+           nfolds = 10,
+           ntrees = 100,
+           stopping_rounds = 10,
+           stopping_tolerance = 0,
+           seed = 123,
+           keep_cross_validation_predictions = TRUE,
+           fold_assignment = "Random")
+
+gbm_model2
+```
+
+
+```{r}
+# Reduced learn_rate to 0.05
+gbm_model3 <- h2o.gbm( x = c("movieId","userId","movies_per_user","users_per_movie") ,
+           y = "rating" , 
+           training_frame = train ,
+           nfolds = 5,
+           ntrees = 100,
+           learn_rate=0.05,
+           stopping_rounds = 10,
+           stopping_tolerance = 0,
+           seed = 123,
+           keep_cross_validation_predictions = TRUE,
+           fold_assignment = "Random")
+
+gbm_model3
+
+```
+
+```{r}
+rmse_default <- h2o.rmse(gbm_default, xval = TRUE)
+rmse_model1 <-  h2o.rmse(gbm_model1, xval = TRUE)
+rmse_model2 <-  h2o.rmse(gbm_model2, xval = TRUE)
+rmse_model3 <-  h2o.rmse(gbm_model3, xval = TRUE)
+```
+
+```{r}
+mae_default <- h2o.mae(gbm_default, xval = TRUE)
+mae_model1 <-  h2o.mae(gbm_model1, xval = TRUE)
+mae_model2 <-  h2o.mae(gbm_model2, xval = TRUE)
+mae_model3 <-  h2o.mae(gbm_model3, xval = TRUE)
+```
+
+```{r}
+r2_default <- h2o.r2(gbm_default, xval = TRUE)
+r2_model1 <-  h2o.r2(gbm_model1, xval = TRUE)
+r2_model2 <-  h2o.r2(gbm_model2, xval = TRUE)
+r2_model3 <-  h2o.r2(gbm_model3, xval = TRUE)
+```
+
+```{r}
+deviance_default <- h2o.mean_residual_deviance(gbm_default, xval = TRUE)
+deviance_model1 <-  h2o.mean_residual_deviance(gbm_model1, xval = TRUE)
+deviance_model2 <-  h2o.mean_residual_deviance(gbm_model2, xval = TRUE)
+deviance_model3 <-  h2o.mean_residual_deviance(gbm_model3, xval = TRUE)
+```
+
+```{r}
+perf_gbm <- data.frame(methods=c("Default","Model 1","Model 2","Model 3"),RMSE = c(rmse_default,rmse_model1,rmse_model2,rmse_model3), MAE=c(mae_default,mae_model1,mae_model2,mae_model3), R2=c(r2_default,r2_model1,r2_model2,r2_model3))
+
+kable(perf_gbm) %>%
+  kable_styling(bootstrap_options = "striped" , full_width = F , position = "center") %>%
+  kable_styling(bootstrap_options = "bordered", full_width = F , position ="center")
+```
+
+```{r}
+results_cv <- function(h2o_model) {
+  h2o_model@model$cross_validation_metrics_summary %>% 
+    as.data.frame() %>% 
+    select(-mean, -sd) %>% 
+    t() %>% 
+    as.data.frame() %>% 
+    mutate_all(as.character) %>% 
+    mutate_all(as.numeric) %>% 
+    select(RMSE = rmse, 
+           MAE = mae,
+           R2 = r2) %>% 
+    return()
+  }
+
+# Use function: 
+results_cv(gbm_model2) -> model
+
+# Model Performance by Graph: 
+theme_set(theme_minimal())
+
+plot_results <- function(df_results) {
+  df_results %>% 
+  gather(Metrics, Values) %>% 
+  ggplot(aes(Metrics, Values, fill = Metrics, color = Metrics)) +
+  geom_boxplot(alpha = 0.3, show.legend = FALSE) + 
+  theme(plot.margin = unit(c(1, 1, 1, 1), "cm")) +    
+  scale_y_continuous(labels = scales::percent) + 
+  facet_wrap(~ Metrics, scales = "free") + 
+  labs(title = "Model Performance: Gradient Boosting Machine", y = NULL)
+  }
+
+plot_results(model) 
+```
+
+
+```{r}
+#i predict ratings on validation set and evaluate RMSE
+gbm_pred <- h2o.predict(gbm_model2,as.h2o(valid))
+
+rmse_gbm <- RMSE(gbm_pred, as.h2o(valid$rating))
+rmse_gbm
+```
+
+```{r}
+#clear unusued memory
+invisible(gc())
+#remove bar progress
+h2o.no_progress()
+
+# Default rf model 
+rf_default <- h2o.randomForest(        
+  training_frame = train,       
+  x= c("movieId" ,"userId" ,"timestamp", "movies_per_user","users_per_movie"),        
+  y= "rating",                         
+  nfolds=5
+)
+
+summary(rf_default)
+```
+
+```{r}
+rf_model1 <- h2o.randomForest(        
+   training_frame = train,       
+   x= c("movieId" ,"userId", "movies_per_user","users_per_movie"),                      
+   y= "rating",                         
+   ntrees = 100,
+   nfolds = 5,
+   stopping_rounds = 10,
+   stopping_tolerance = 0,
+   seed=123,
+   keep_cross_validation_predictions = TRUE,
+   fold_assignment = "Random")
+ 
+ summary(rf_model1)
+```
+
+```{r}
+rf_model2 <- h2o.randomForest(        
+   training_frame = train,       
+   x= c("movieId" ,"userId", "movies_per_user","users_per_movie"),                      
+   y= "rating",                         
+   ntrees = 100,
+   nfolds = 10,
+   stopping_rounds = 10,
+   stopping_tolerance = 0,
+   seed=123,
+   keep_cross_validation_predictions = TRUE,
+   fold_assignment = "Random")
+ 
+ summary(rf_model2)
+```
+
+```{r}
+rf_model3 <- h2o.randomForest(        
+  training_frame = train,       
+  x= c("movieId" ,"userId","movies_per_user","users_per_movie"),                      
+  y= "rating", 
+  nfolds=10,
+  ntrees=100,
+  max_depth = 10,
+  stopping_rounds = 10,
+  stopping_tolerance = 0,
+  seed=123,
+  keep_cross_validation_predictions = TRUE,
+  fold_assignment = "Random")
+
+summary(rf_model3)
+```
+
+
+```{r}
+rmse_default <- h2o.rmse(rf_default, xval = TRUE)
+rmse_model1 <-  h2o.rmse(rf_model1, xval = TRUE)
+rmse_model2 <-  h2o.rmse(rf_model2, xval = TRUE)
+rmse_model3 <-  h2o.rmse(rf_model3, xval = TRUE)
+```
+
+```{r}
+mae_default <- h2o.mae(rf_default, xval = TRUE)
+mae_model1 <-  h2o.mae(rf_model1, xval = TRUE)
+mae_model2 <-  h2o.mae(rf_model2, xval = TRUE)
+mae_model3 <-  h2o.mae(rf_model3, xval = TRUE)
+```
+
+```{r}
+r2_default <- h2o.r2(rf_default, xval = TRUE)
+r2_model1 <-  h2o.r2(rf_model1, xval = TRUE)
+r2_model2 <-  h2o.r2(rf_model2, xval = TRUE)
+r2_model3 <-  h2o.r2(rf_model3, xval = TRUE)
+```
+
+```{r}
+deviance_default <- h2o.mean_residual_deviance(rf_default, xval = TRUE)
+deviance_model1 <-  h2o.mean_residual_deviance(rf_model1, xval = TRUE)
+deviance_model2 <-  h2o.mean_residual_deviance(rf_model2, xval = TRUE)
+deviance_model3 <-  h2o.mean_residual_deviance(rf_model3, xval = TRUE)
+```
+
+```{r}
+perf_rf <- data.frame(Models=c("Default","Model 1","Model 2","Model 3"),RMSE = c(rmse_default,rmse_model1,rmse_model2,rmse_model3), MAE=c(mae_default,mae_model1,mae_model2,mae_model3), R2=c(r2_default,r2_model1,r2_model2,r2_model3))
+
+kable(perf_rf) %>%
+  kable_styling(bootstrap_options = "striped" , full_width = F , position = "center") %>%
+  kable_styling(bootstrap_options = "bordered", full_width = F , position ="center")
+```
+
+```{r}
+# We select model2 since it has the least rmse for 10 fold cross validation
+results_cv <- function(h2o_model) {
+  h2o_model@model$cross_validation_metrics_summary %>% 
+    as.data.frame() %>% 
+    select(-mean, -sd) %>% 
+    t() %>% 
+    as.data.frame() %>% 
+    mutate_all(as.character) %>% 
+    mutate_all(as.numeric) %>% 
+    select(RMSE = rmse, 
+           MAE = mae,
+           R2 = r2) %>% 
+    return()
+  }
+
+# Use function: 
+results_cv(rf_model3) -> model
+
+# Model Performance by Graph: 
+theme_set(theme_minimal())
+
+plot_results <- function(df_results) {
+  df_results %>% 
+  gather(Metrics, Values) %>% 
+  ggplot(aes(Metrics, Values, fill = Metrics, color = Metrics)) +
+  geom_boxplot(alpha = 0.3, show.legend = FALSE) + 
+  theme(plot.margin = unit(c(1, 1, 1, 1), "cm")) +    
+  scale_y_continuous(labels = scales::percent) + 
+  facet_wrap(~ Metrics, scales = "free") + 
+  labs(title = "Model Performance: Random Forest", y = NULL)
+  }
+
+plot_results(model) 
+```
+
+
+```{r}
+# Predict ratings on validation set 
+rf_pred <- h2o.predict(rf_model3,as.h2o(valid))
+
+rmse_rf <- RMSE(rf_pred, as.h2o(valid$rating))
+rmse_rf
+```
+
+```{r}
+# Stacked Ensemble : take the best two previous models (gbdt_3 and rf_3)
+
+ensemble_model <- h2o.stackedEnsemble(x = c("movieId" ,"userId","movies_per_user","users_per_movie"),
+                                y = "rating",
+                                training_frame = train,
+                                model_id = "my_ensemble_auto",
+                                base_models = list(gbm_model2@model_id, rf_model3@model_id))
+
+# Predict ratings on validation set
+ensemble_pred <- h2o.predict(ensemble_model,as.h2o(valid))
+
+rmse_ensemble <- RMSE(ensemble_pred, as.h2o(valid$rating))
+rmse_ensemble
+```
+
+```{r}
+rmse_ensemble_methods <- data.frame(Methods=c("gradient Boosting","random forest","stacked ensemble"),RMSE = c(rmse_gbm, rmse_rf, rmse_ensemble))
+
+kable(rmse_ensemble_methods) %>%
+  kable_styling(bootstrap_options = "striped" , full_width = F , position = "center") %>%
+  kable_styling(bootstrap_options = "bordered", full_width = F , position ="center") 
+```
+
+```{r}
+rmse_results <- data.frame(methods=c("Movie Effect","Movie + User Effects","Movie + User + Time Effects","Regularized Movie + User Effect","Popularity Model", "Random Model","UBCF Model","IBCF Model","Gradient Boosting","Random Forest","Stacked Ensemble"),rmse = c(rmse_Bm, rmse_Bu,rmse_Bt,rmse_reg,rmse_popular[1],rmse_random[1],rmse_ubcf[1],rmse_ibcf[1],rmse_gbm, rmse_rf, rmse_ensemble))
+
+kable(rmse_results) %>%
+  kable_styling(bootstrap_options = "striped" , full_width = F , position = "center") %>%
+  kable_styling(bootstrap_options = "bordered", full_width = F , position ="center") %>%
+  column_spec(1,bold = T ) %>%
+  column_spec(2,bold = T )
+```
+
+
+```{r}
+#remove objects
+rm(train3,valid)
+
+```
+
+
+
